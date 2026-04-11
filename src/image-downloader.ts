@@ -14,7 +14,7 @@ export async function downloadImageFromUrl(
   workspaceDir?: string,
 ): Promise<string | undefined> {
   try {
-    const targetDir = workspaceDir || path.join(os.homedir(), ".openclaw/workspace/media");
+    const targetDir = workspaceDir || path.join(os.homedir(), ".openclaw/media/inbound");
 
     // Ensure directory exists
     if (!fs.existsSync(targetDir)) {

@@ -1,25 +1,17 @@
-import type { OpenClawConfig, MarkdownTableMode, RuntimeEnv } from "openclaw/plugin-sdk/channel-plugin-common";
-import { createReplyPrefixOptions, createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
+import type { OpenClawConfig, MarkdownTableMode, RuntimeEnv } from "openclaw/plugin-sdk";
+import {
+  createReplyPrefixOptions,
+  createTypingCallbacks,
+} from "openclaw/plugin-sdk/channel-reply-pipeline";
 import { logTypingFailure, logAckFailure } from "openclaw/plugin-sdk/channel-feedback";
 import { mergeAllowlist, summarizeMapping } from "openclaw/plugin-sdk/allow-from";
-// Inline mention gating to avoid compat barrel issues with OpenClaw SDK
-function resolveMentionGatingWithBypass(params: {
-  isGroup: boolean; requireMention: boolean; canDetectMention: boolean;
-  wasMentioned: boolean; allowTextCommands: boolean; hasControlCommand: boolean;
-  commandAuthorized: boolean;
-}): { shouldSkip: boolean } {
-  if (!params.isGroup || !params.requireMention) return { shouldSkip: false };
-  if (params.wasMentioned) return { shouldSkip: false };
-  if (params.allowTextCommands && params.hasControlCommand && params.commandAuthorized) return { shouldSkip: false };
-  return { shouldSkip: true };
-}
+import { resolveMentionGatingWithBypass } from "openclaw/plugin-sdk/channel-inbound";
 import { ThreadType, FriendEventType, Reactions, type API, type Message, type UserMessage, type GroupMessage, type FriendEvent } from "zca-js";
 import type { ResolvedZaloPersonalAccount, ZaloPersonalFriend, ZaloPersonalGroup, ZaloPersonalMessage } from "./types.js";
 import { getZaloPersonalRuntime } from "./runtime.js";
 import { sendMessageZaloPersonal } from "./send.js";
 import { getApi, getCurrentUid } from "./zalo-client.js";
 import { downloadImagesFromUrls } from "./image-downloader.js";
-import { getThreadMediaDir } from "./thread-sandbox.js";
 import { addPendingRequest, removePendingRequest } from "./friend-request-store.js";
 import { refreshCredentials } from "./credentials.js";
 
@@ -47,11 +39,13 @@ const groupMessageBuffer = new Map<string, Array<{
   senderName: string;
   content: string;
   timestamp: number;
+  mediaUrls?: string[];
+  localMediaPaths?: string[];
 }>>();
 const GROUP_BUFFER_MAX_MESSAGES = 50;
 const GROUP_BUFFER_MAX_AGE_S = 4 * 60 * 60; // 4 hours
 
-function bufferGroupMessage(groupId: string, entry: { senderName: string; content: string; timestamp: number }): void {
+function bufferGroupMessage(groupId: string, entry: { senderName: string; content: string; timestamp: number; mediaUrls?: string[]; localMediaPaths?: string[] }): void {
   let buffer = groupMessageBuffer.get(groupId) ?? [];
   buffer.push(entry);
   const cutoff = Math.floor(Date.now() / 1000) - GROUP_BUFFER_MAX_AGE_S;
@@ -59,12 +53,22 @@ function bufferGroupMessage(groupId: string, entry: { senderName: string; conten
   groupMessageBuffer.set(groupId, buffer);
 }
 
-function consumeGroupBuffer(groupId: string): string {
+function consumeGroupBuffer(groupId: string): { text: string; mediaPaths: string[] } {
   const buffer = groupMessageBuffer.get(groupId);
-  if (!buffer || buffer.length === 0) return "";
-  const lines = buffer.map(m => `[${m.senderName}]: ${m.content}`);
+  if (!buffer || buffer.length === 0) return { text: "", mediaPaths: [] };
+  const allMediaPaths: string[] = [];
+  const lines = buffer.map(m => {
+    let line = `[${m.senderName}]: ${m.content}`;
+    if (m.localMediaPaths && m.localMediaPaths.length > 0) {
+      m.localMediaPaths.forEach(p => allMediaPaths.push(p));
+      line += ` [attached ${m.localMediaPaths.length} image(s)]`;
+    } else if (m.mediaUrls && m.mediaUrls.length > 0) {
+      line += ` [image: ${m.mediaUrls.join(", ")}]`;
+    }
+    return line;
+  });
   groupMessageBuffer.delete(groupId);
-  return lines.join("\n");
+  return { text: lines.join("\n"), mediaPaths: allMediaPaths };
 }
 
 async function resolveUserName(userId: string): Promise<string> {
@@ -321,6 +325,28 @@ function convertToZaloPersonalMessage(msg: Message): ZaloPersonalMessage | null 
     return null;
   }
 
+  // Extract quoted/replied message media (Zalo sends image separately from mention)
+  const quote = (data as any).quote as { ownerId?: string; msg?: string; attach?: string; fromD?: string } | undefined;
+  if (quote?.attach) {
+    try {
+      const attachData = JSON.parse(quote.attach);
+      // attach can be object or array
+      const attachList = Array.isArray(attachData) ? attachData : [attachData];
+      for (const item of attachList) {
+        const url = item.href || item.url || item.thumb;
+        if (url && !mediaUrls.includes(url)) {
+          mediaUrls.push(url);
+          const t = (item.type || "").toLowerCase();
+          if (t.includes("photo") || t.includes("image")) mediaTypes.push("image/jpeg");
+          else if (t.includes("video")) mediaTypes.push("video/mp4");
+          else mediaTypes.push("image/jpeg"); // default assume image
+        }
+      }
+    } catch {
+      // attach not parseable JSON, skip
+    }
+  }
+
   const isGroup = msg.type === ThreadType.Group;
   const threadId = msg.threadId;
   // For DMs, if uidFrom is not numeric (obfuscated ID), use threadId instead
@@ -532,10 +558,18 @@ async function processMessage(
     if (mentionGate.shouldSkip) {
       // Buffer message for context (no AI tokens spent)
       const resolvedName = senderName || await resolveUserName(senderId);
+      // Download media for buffered messages too, so they're available when bot is mentioned later
+      let bufferedLocalPaths: string[] | undefined;
+      if (message.mediaUrls && message.mediaUrls.length > 0) {
+        const downloaded = await downloadImagesFromUrls(message.mediaUrls);
+        bufferedLocalPaths = downloaded.filter((p): p is string => p !== undefined);
+      }
       bufferGroupMessage(chatId, {
         senderName: resolvedName,
         content: rawBody,
         timestamp: timestamp ?? Math.floor(Date.now() / 1000),
+        mediaUrls: message.mediaUrls,
+        localMediaPaths: bufferedLocalPaths,
       });
       logVerbose(core, runtime, `Buffered non-mention message in group ${chatId} from ${senderId}`);
       return;
@@ -571,23 +605,59 @@ async function processMessage(
   });
 
   // Inject buffered group context when bot is mentioned
-  const bufferedContext = isGroup ? consumeGroupBuffer(chatId) : "";
+  const bufferedContext = isGroup ? consumeGroupBuffer(chatId) : { text: "", mediaPaths: [] };
+  const bufferedMediaPaths = bufferedContext.mediaPaths ?? [];
 
   // Prepend sender context for group messages so the AI knows who sent what
   let bodyWithSender = isGroup
     ? `[userId: ${senderId}, name: ${resolvedSenderName}]: ${rawBody}`
     : rawBody;
 
-  if (bufferedContext) {
-    bodyWithSender = `[Recent group chat (context only, not addressed to you):\n${bufferedContext}\n]\n\n${bodyWithSender}`;
+  if (bufferedContext.text) {
+    bodyWithSender = `[Recent group chat (context only, not addressed to you):\n${bufferedContext.text}\n]\n\n${bodyWithSender}`;
+  }
+
+  // --- Auto fetch user info for mentioned users (excluding self) ---
+  if (isGroup && message.mentions && message.mentions.length > 0) {
+    const mentionedUserIds = message.mentions
+      .filter(m => m.type === 0 && m.uid && m.uid !== getCurrentUid()) // type 0 = user, skip bot self
+      .map(m => m.uid);
+
+    if (mentionedUserIds.length > 0) {
+      try {
+        const api = await getApi();
+        const userInfos: string[] = [];
+        for (const uid of mentionedUserIds) {
+          try {
+            const result = await api.getUserInfo(uid);
+            const profiles = result?.changed_profiles ?? {};
+            const info = Object.values(profiles)[0] as any;
+            if (info) {
+              const name = info.displayName ?? info.display_name ?? info.zaloName ?? uid;
+              const gender = info.gender ? ` | gender: ${info.gender}` : "";
+              const dob = info.dob ? ` | dob: ${info.dob}` : "";
+              userInfos.push(`  - @${name} (userId: ${uid}${gender}${dob})`);
+            } else {
+              userInfos.push(`  - userId: ${uid} (profile not available)`);
+            }
+          } catch {
+            userInfos.push(`  - userId: ${uid} (failed to fetch info)`);
+          }
+        }
+        if (userInfos.length > 0) {
+          bodyWithSender = `[Mentioned users info:\n${userInfos.join("\n")}\n]\n\n${bodyWithSender}`;
+        }
+      } catch {
+        // getApi failed — skip mention enrichment
+      }
+    }
   }
 
   // Download media URLs to local files for native image support (BEFORE creating body)
   let localMediaPaths: string[] | undefined;
   if (message.mediaUrls && message.mediaUrls.length > 0) {
     console.log(`[zalo-personal] Downloading ${message.mediaUrls.length} images for native image support...`);
-    const threadMediaDir = getThreadMediaDir(chatId);
-    const downloadedPaths = await downloadImagesFromUrls(message.mediaUrls, threadMediaDir);
+    const downloadedPaths = await downloadImagesFromUrls(message.mediaUrls);
     localMediaPaths = downloadedPaths.filter((p): p is string => p !== undefined);
 
     if (localMediaPaths.length > 0) {
@@ -597,9 +667,19 @@ async function processMessage(
     }
   }
 
+  // Merge buffered media paths from previous group messages (images sent before @mention)
+  const allMediaPaths = [
+    ...(localMediaPaths ?? []),
+    ...bufferedMediaPaths,
+  ];
+  if (allMediaPaths.length > localMediaPaths?.length! && bufferedMediaPaths.length > 0) {
+    console.log(`[zalo-personal] Injecting ${bufferedMediaPaths.length} buffered image(s) from group context`);
+  }
+  const effectiveLocalMediaPaths = allMediaPaths.length > 0 ? allMediaPaths : undefined;
+
   // Append media to body - use LOCAL paths if downloaded, otherwise URLs
   let bodyForEnvelope = bodyWithSender;
-  const mediaPathsForBody = localMediaPaths && localMediaPaths.length > 0 ? localMediaPaths : message.mediaUrls;
+    const mediaPathsForBody = effectiveLocalMediaPaths && effectiveLocalMediaPaths.length > 0 ? effectiveLocalMediaPaths : message.mediaUrls;
   if (mediaPathsForBody && mediaPathsForBody.length > 0) {
     const mediaInfo = mediaPathsForBody.map((path, idx) =>
       `[Image ${idx + 1}: ${path}]`
@@ -625,6 +705,7 @@ async function processMessage(
     SessionKey: route.sessionKey,
     AccountId: route.accountId,
     ChatType: isGroup ? "group" : "direct",
+    WasMentioned: wasMentioned || undefined,
     ConversationLabel: fromLabel,
     SenderName: resolvedSenderName || undefined,
     SenderId: senderId,
@@ -635,9 +716,11 @@ async function processMessage(
     OriginatingChannel: "zalo-personal",
     OriginatingTo: `'zalo-personal':${chatId}`,
     // Media fields (OpenClaw standard schema)
-    // Use local paths if downloaded, otherwise fall back to URLs
-    MediaUrls: localMediaPaths && localMediaPaths.length > 0 ? localMediaPaths : message.mediaUrls,
-    MediaUrl: localMediaPaths && localMediaPaths.length > 0 ? localMediaPaths[0] : message.mediaUrls?.[0],
+    // MediaPaths = local file paths (downloaded + buffered), MediaUrls = remote URLs fallback
+    MediaPaths: effectiveLocalMediaPaths && effectiveLocalMediaPaths.length > 0 ? effectiveLocalMediaPaths : undefined,
+    MediaPath: effectiveLocalMediaPaths && effectiveLocalMediaPaths.length > 0 ? effectiveLocalMediaPaths[0] : undefined,
+    MediaUrls: effectiveLocalMediaPaths && effectiveLocalMediaPaths.length > 0 ? undefined : message.mediaUrls,
+    MediaUrl: effectiveLocalMediaPaths && effectiveLocalMediaPaths.length > 0 ? undefined : message.mediaUrls?.[0],
     MediaTypes: message.mediaTypes,
   });
 

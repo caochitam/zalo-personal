@@ -3,7 +3,7 @@ import type {
   ChannelOnboardingDmPolicy,
   OpenClawConfig,
   WizardPrompter,
-} from "openclaw/plugin-sdk/channel-plugin-common";
+} from "openclaw/plugin-sdk";
 import {
   DEFAULT_ACCOUNT_ID,
   normalizeAccountId,
@@ -468,7 +468,7 @@ export const zaloPersonalOnboardingAdapter: ChannelOnboardingAdapter = {
       }
     }
 
-    // Enable the channel and ensure account entry exists
+    // Enable the channel
     if (accountId === DEFAULT_ACCOUNT_ID) {
       next = {
         ...next,
@@ -477,13 +477,6 @@ export const zaloPersonalOnboardingAdapter: ChannelOnboardingAdapter = {
           'zalo-personal': {
             ...next.channels?.['zalo-personal'],
             enabled: true,
-            accounts: {
-              ...next.channels?.['zalo-personal']?.accounts,
-              [DEFAULT_ACCOUNT_ID]: {
-                ...next.channels?.['zalo-personal']?.accounts?.[DEFAULT_ACCOUNT_ID],
-                enabled: true,
-              },
-            },
           },
         },
       } as OpenClawConfig;

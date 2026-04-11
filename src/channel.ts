@@ -6,7 +6,7 @@ import type {
   ChannelPlugin,
   OpenClawConfig,
   GroupToolPolicyConfig,
-} from "openclaw/plugin-sdk/channel-plugin-common";
+} from "openclaw/plugin-sdk";
 import {
   applyAccountNameToChannelSection,
   buildChannelConfigSchema,

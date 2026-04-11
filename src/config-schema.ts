@@ -1,5 +1,4 @@
-import { MarkdownConfigSchema } from "openclaw/plugin-sdk/channel-config-primitives";
-import { ToolPolicySchema } from "openclaw/plugin-sdk/agent-config-primitives";
+import { MarkdownConfigSchema, ToolPolicySchema } from "openclaw/plugin-sdk/channel-config-schema";
 import { z } from "zod";
 
 const allowFromEntry = z.union([z.string(), z.number()]);
