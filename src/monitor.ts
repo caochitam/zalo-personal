@@ -6,7 +6,7 @@ import {
 import { logTypingFailure, logAckFailure } from "openclaw/plugin-sdk/channel-feedback";
 import { mergeAllowlist, summarizeMapping } from "openclaw/plugin-sdk/allow-from";
 import { resolveMentionGatingWithBypass } from "openclaw/plugin-sdk/channel-inbound";
-import { ThreadType, FriendEventType, Reactions, type API, type Message, type UserMessage, type GroupMessage, type FriendEvent } from "zca-js";
+import { ThreadType, FriendEventType, Reactions, type API, type Message, type UserMessage, type GroupMessage, type FriendEvent, type SendMessageQuote } from "zca-js";
 import type { ResolvedZaloPersonalAccount, ZaloPersonalFriend, ZaloPersonalGroup, ZaloPersonalMessage } from "./types.js";
 import { getZaloPersonalRuntime } from "./runtime.js";
 import { sendMessageZaloPersonal } from "./send.js";
@@ -44,6 +44,55 @@ const groupMessageBuffer = new Map<string, Array<{
 }>>();
 const GROUP_BUFFER_MAX_MESSAGES = 50;
 const GROUP_BUFFER_MAX_AGE_S = 4 * 60 * 60; // 4 hours
+
+// --- Inbound message cache: stores last inbound message per thread for quote-reply ---
+const lastInboundMessage = new Map<string, {
+  msgId: string;
+  cliMsgId: string;
+  content: string;
+  msgType: number;
+  uidFrom: string;
+  ts: number;
+  ttl: number;
+  propertyExt?: Record<string, unknown>;
+}>();
+const INBOUND_CACHE_MAX = 500;
+
+function cacheInboundMessage(threadId: string, data: {
+  msgId: string; cliMsgId: string; content: string; msgType?: number;
+  uidFrom: string; ts: number; ttl?: number; propertyExt?: Record<string, unknown>;
+}): void {
+  // Evict oldest if cache too large
+  if (lastInboundMessage.size >= INBOUND_CACHE_MAX && !lastInboundMessage.has(threadId)) {
+    const oldest = lastInboundMessage.keys().next().value;
+    if (oldest) lastInboundMessage.delete(oldest);
+  }
+  lastInboundMessage.set(threadId, {
+    msgId: data.msgId,
+    cliMsgId: data.cliMsgId,
+    content: data.content,
+    msgType: data.msgType ?? 0,
+    uidFrom: data.uidFrom,
+    ts: data.ts,
+    ttl: data.ttl ?? 0,
+    propertyExt: data.propertyExt,
+  });
+}
+
+function getQuoteForThread(threadId: string): SendMessageQuote | undefined {
+  const cached = lastInboundMessage.get(threadId);
+  if (!cached) return undefined;
+  return {
+    content: cached.content,
+    msgType: cached.msgType,
+    propertyExt: (cached.propertyExt ?? {}) as any,
+    uidFrom: cached.uidFrom,
+    msgId: cached.msgId as any,
+    cliMsgId: cached.cliMsgId as any,
+    ts: cached.ts as any,
+    ttl: cached.ttl as any,
+  };
+}
 
 function bufferGroupMessage(groupId: string, entry: { senderName: string; content: string; timestamp: number; mediaUrls?: string[]; localMediaPaths?: string[] }): void {
   let buffer = groupMessageBuffer.get(groupId) ?? [];
@@ -392,6 +441,17 @@ async function processMessage(
   const { threadId, content, timestamp, metadata } = message;
   if (!content?.trim()) {
     return;
+  }
+
+  // Cache inbound message for quote-reply support
+  if (message.msgId && message.cliMsgId) {
+    cacheInboundMessage(threadId, {
+      msgId: message.msgId,
+      cliMsgId: message.cliMsgId,
+      content: content,
+      uidFrom: metadata?.fromId ?? threadId,
+      ts: timestamp,
+    });
   }
 
   const isGroup = metadata?.isGroup ?? false;
@@ -821,6 +881,9 @@ async function processMessage(
     },
   });
 
+  // Get the quote for the inbound message to enable reply-to-specific
+  const quoteForReply = isGroup ? getQuoteForThread(chatId) : getQuoteForThread(chatId);
+
   try {
     await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
@@ -837,6 +900,7 @@ async function processMessage(
             config,
             accountId: account.accountId,
             statusSink,
+            quote: quoteForReply,
             tableMode: core.channel.text.resolveMarkdownTableMode({
               cfg: config,
               channel: "zalo-personal",
@@ -923,6 +987,7 @@ async function deliverZaloPersonalReply(params: {
   accountId?: string;
   statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
   tableMode?: MarkdownTableMode;
+  quote?: SendMessageQuote;  // Quote-reply to the inbound message
 }): Promise<void> {
   const { payload, chatId, isGroup, runtime, core, config, accountId, statusSink } = params;
 
@@ -948,6 +1013,14 @@ async function deliverZaloPersonalReply(params: {
       ? [payload.mediaUrl]
       : [];
 
+  // Quote is only attached to the first outbound message (first media or first chunk)
+  let quoteUsed = false;
+  const getQuoteOnce = () => {
+    if (quoteUsed || !params.quote) return undefined;
+    quoteUsed = true;
+    return params.quote;
+  };
+
   if (mediaList.length > 0) {
     let first = true;
     for (const mediaUrl of mediaList) {
@@ -958,6 +1031,7 @@ async function deliverZaloPersonalReply(params: {
         await sendMessageZaloPersonal(chatId, caption ?? "", {
           mediaUrl,
           isGroup,
+          quote: getQuoteOnce(),
         });
         statusSink?.({ lastOutboundAt: Date.now() });
       } catch (err) {
@@ -977,7 +1051,7 @@ async function deliverZaloPersonalReply(params: {
     logVerbose(core, runtime, `Sending ${chunks.length} text chunk(s) to ${chatId}`);
     for (const chunk of chunks) {
       try {
-        await sendMessageZaloPersonal(chatId, chunk, { isGroup });
+        await sendMessageZaloPersonal(chatId, chunk, { isGroup, quote: getQuoteOnce() });
         statusSink?.({ lastOutboundAt: Date.now() });
       } catch (err) {
         runtime.error(`ZaloPersonal message send failed: ${String(err)}`);
@@ -1263,6 +1337,36 @@ export async function monitorZaloPersonalProvider(
         return;
       }
       listenersRegistered = true;
+
+      // --- Prefill group message buffer from chat history on startup ---
+      const groups = account.config.groups ?? {};
+      const groupIds = Object.keys(groups).filter(k => k !== "*" && !k.startsWith("group:"));
+      if (groupIds.length > 0) {
+        for (const groupId of groupIds) {
+          try {
+            const history = await api.getGroupChatHistory(groupId, 20);
+            const msgs = history?.groupMsgs ?? [];
+            for (const gm of msgs) {
+              const gmData = (gm as any).data ?? gm;
+              const gmContent = typeof gmData.content === "string" ? gmData.content : "";
+              const gmSenderName = gmData.dName ?? gmData.uidFrom ?? "unknown";
+              const gmTs = gmData.ts ? parseInt(gmData.ts, 10) : 0;
+              if (gmContent && gmTs > 0) {
+                bufferGroupMessage(groupId, {
+                  senderName: gmSenderName,
+                  content: gmContent,
+                  timestamp: gmTs,
+                });
+              }
+            }
+            if (msgs.length > 0) {
+              logVerbose(core, runtime, `[${account.accountId}] Prefilled ${msgs.length} messages for group ${groupId}`);
+            }
+          } catch (err) {
+            logVerbose(core, runtime, `[${account.accountId}] Failed to prefill history for group ${groupId}: ${String(err)}`);
+          }
+        }
+      }
 
       api.listener.on("message", (msg: Message) => {
         // Skip self messages

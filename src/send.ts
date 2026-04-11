@@ -1,12 +1,8 @@
-import { ThreadType, TextStyle, type Style, type MessageContent, type Mention } from "zca-js";
+import { ThreadType, TextStyle, type Style, type MessageContent, type Mention, type SendMessageQuote } from "zca-js";
 import { getApi } from "./zalo-client.js";
 import { resolveOutboundMentions } from "./mention-parser.js";
-import { redactOutput } from "./output-filter.js";
 import * as fs from "fs";
 import * as path from "path";
-
-const ZALO_MAX_TEXT_LENGTH = 4000;
-const TRUNCATION_SUFFIX = "\n\n[...tin nhắn quá dài, đã cắt bớt]";
 
 /**
  * Convert markdown to Zalo TextStyle.
@@ -74,6 +70,7 @@ export type ZaloPersonalSendOptions = {
   isGroup?: boolean;
   localPath?: string;  // Local file path to upload
   cleanupAfterUpload?: boolean;  // Delete local file after upload
+  quote?: SendMessageQuote;  // Quote/reply to a specific message
 };
 
 export type ZaloPersonalSendResult = {
@@ -118,12 +115,7 @@ export async function sendMessageZaloPersonal(
   try {
     const api = await getApi();
     const type = options.isGroup ? ThreadType.Group : ThreadType.User;
-    // Redact internal info (paths, tool names, tokens) before sending
-    const redacted = redactOutput(text);
-    // Truncate to Zalo's limit with indicator
-    const truncated = redacted.length > ZALO_MAX_TEXT_LENGTH
-      ? redacted.slice(0, ZALO_MAX_TEXT_LENGTH - TRUNCATION_SUFFIX.length) + TRUNCATION_SUFFIX
-      : redacted;
+    const truncated = text.slice(0, 2000);
     const { text: postMarkdownText, styles } = markdownToZaloStyles(truncated);
     // Resolve @[Name]/@Name → Zalo Mention[] AFTER markdown styling. Mention
     // parsing strips `[`/`]`, which can shift any style span that started
@@ -144,12 +136,15 @@ export async function sendMessageZaloPersonal(
         });
       }
     }
-    const content: { msg: string; styles?: Style[]; mentions?: Mention[] } = { msg: outboundText };
+    const content: { msg: string; styles?: Style[]; mentions?: Mention[]; quote?: SendMessageQuote } = { msg: outboundText };
     if (alignedStyles.length > 0) {
       content.styles = alignedStyles;
     }
     if (mentions.length > 0) {
       content.mentions = mentions;
+    }
+    if (options.quote) {
+      content.quote = options.quote;
     }
     const result = await api.sendMessage(
       content,
