@@ -21,9 +21,11 @@ export async function downloadImageFromUrl(
       fs.mkdirSync(targetDir, { recursive: true });
     }
 
-    // Generate filename from URL hash + timestamp
+    // Generate filename from URL hash + timestamp (local time, not UTC)
     const urlHash = crypto.createHash("md5").update(url).digest("hex").substring(0, 8);
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").substring(0, 19);
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const timestamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
     const ext = getExtensionFromUrl(url) || "jpg";
     const filename = `${timestamp}-zalo-${urlHash}.${ext}`;
     const filePath = path.join(targetDir, filename);
