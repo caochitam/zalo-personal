@@ -2,6 +2,14 @@
 
 All notable changes to the zalo-personal OpenClaw extension will be documented in this file.
 
+## [2.4.2] - 2026-07-15
+
+### Added
+- **Tool contract declaration**: the plugin now advertises `contracts: { tools: ["zalo-personal"] }` in both `index.ts` and `openclaw.plugin.json`, so newer OpenClaw builds can discover the `zalo-personal` tool from the manifest during contract resolution.
+
+### Fixed
+- **`openclaw.plugin.json` formatting**: restored clean 2-space JSON (removed a UTF-8 BOM and `'`-escaped apostrophes introduced by a Windows/PowerShell round-trip) so the manifest stays diff-friendly and BOM-free.
+
 ## [2.4.1] - 2026-05-31
 
 ### Fixed

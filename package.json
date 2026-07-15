@@ -1,6 +1,6 @@
 {
   "name": "zalo-personal",
-  "version": "2.4.1",
+  "version": "2.4.2",
   "description": "OpenClaw extension for Zalo Personal Account via zca-js library. Login via QR code, no CLI tools needed. Works with OpenClaw 2026.2+",
   "type": "module",
   "main": "./index.ts",

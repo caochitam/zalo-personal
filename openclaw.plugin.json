@@ -26,5 +26,10 @@
       "label": "Zalo Personal",
       "description": "Zalo personal account via zca-js library (no CLI needed)."
     }
+  },
+  "contracts": {
+    "tools": [
+      "zalo-personal"
+    ]
   }
 }

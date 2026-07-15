@@ -9,6 +9,7 @@ const plugin = {
   name: "Zalo Personal",
   description: "Zalo personal account messaging via zca-js library",
   configSchema: emptyPluginConfigSchema(),
+  contracts: { tools: ["zalo-personal"] },
   register(api: OpenClawPluginApi) {
     setZaloPersonalRuntime(api.runtime);
     // Register channel plugin (for onboarding & gateway)
