@@ -1238,6 +1238,8 @@ export async function monitorZaloPersonalProvider(
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
   let keepAliveTimer: ReturnType<typeof setInterval> | null = null;
   let resolveRunning: (() => void) | null = null;
+  let reconnectAttempts = 0;
+  let activeApi: any = null;
 
   // Resolve allowFrom name→id mappings using zca-js API
   try {
@@ -1479,6 +1481,12 @@ export async function monitorZaloPersonalProvider(
       clearInterval(keepAliveTimer);
       keepAliveTimer = null;
     }
+    if (activeApi) {
+      // Tear down the live zca-js socket + its internal ping interval on shutdown.
+      // stopped=true (set above) guarantees the resulting async "closed" event is
+      // treated as a shutdown and will NOT trigger a reconnect.
+      try { activeApi.listener.stop(); } catch (_) { /* ignore if not running */ }
+    }
     resolveRunning?.();
   };
 
@@ -1494,13 +1502,15 @@ export async function monitorZaloPersonalProvider(
 
     try {
       const api = await getApi();
+      activeApi = api;
       const selfUid = getCurrentUid();
 
       // Register event handlers only once to avoid duplicate processing
       if (listenersRegistered) {
         // Stop existing listener first to avoid "Already started" error
         try { api.listener.stop(); } catch (_) { /* ignore if not running */ }
-        api.listener.start({ retryOnClose: true });
+        // We own reconnection at the app level; never let zca-js also auto-retry.
+        api.listener.start({ retryOnClose: false });
         return;
       }
       listenersRegistered = true;
@@ -1577,43 +1587,97 @@ export async function monitorZaloPersonalProvider(
           clearInterval(keepAliveTimer);
           keepAliveTimer = null;
         }
-        // Let retryOnClose handle reconnection automatically; only resolve if stopped
         if (stopped || abortSignal.aborted) {
           resolveRunning?.();
+          return;
         }
+        // Unexpected close (idle drop / code 1006 / network blip). zca-js's built-in
+        // retryOnClose does NOT reliably recover from these, which made the bot go
+        // silent until a manual gateway restart. Re-establish at the application level.
+        // Note: zca-js runs reset() (this.ws = null) before emitting "closed", so the
+        // socket is already gone here and scheduleReconnect() can start() a fresh one.
+        scheduleReconnect();
       });
 
       api.listener.on("connected", () => {
+        reconnectAttempts = 0;
         logVerbose(core, runtime, `[${account.accountId}] zca-js listener connected`);
       });
 
-      // Use retryOnClose to let zca-js handle reconnection — do NOT also restart manually
-      api.listener.start({ retryOnClose: true });
-
-      // keepAlive heartbeat using server-recommended interval
-      // Side-effect: HTTP requests trigger Set-Cookie refresh, which we persist to disk
-      // This ensures gateway restarts can reuse valid session cookies
-      const keepaliveDuration = api.getContext().settings?.keepalive?.keepalive_duration;
-      if (keepaliveDuration && keepaliveDuration > 0) {
-        const intervalMs = keepaliveDuration * 1000;
-        runtime.log?.(`[${account.accountId}] keepAlive enabled: ${keepaliveDuration}s interval (${intervalMs}ms)`);
-
-        keepAliveTimer = setInterval(async () => {
-          if (stopped || abortSignal.aborted) return;
-          try {
-            await api.keepAlive();
-            // Persist refreshed cookies to disk (request() auto-updates CookieJar in RAM)
-            const jar = api.getCookie();
-            const serialized = jar.serializeSync?.()?.cookies ?? jar.toJSON?.()?.cookies;
-            if (serialized) {
-              refreshCredentials(serialized);
+      // Application-level reconnection (retryOnClose disabled everywhere): every
+      // websocket close routes through the "closed" handler above, which calls
+      // scheduleReconnect() to re-start the listener with exponential backoff and
+      // re-arm keepAlive. armKeepAlive is idempotent (clears any existing timer).
+      const armKeepAlive = () => {
+        if (keepAliveTimer) {
+          clearInterval(keepAliveTimer);
+          keepAliveTimer = null;
+        }
+        // keepAlive heartbeat using server-recommended interval.
+        // Side-effect: HTTP requests trigger Set-Cookie refresh, which we persist to
+        // disk so gateway restarts can reuse valid session cookies.
+        const keepaliveDuration = api.getContext().settings?.keepalive?.keepalive_duration;
+        if (keepaliveDuration && keepaliveDuration > 0) {
+          const intervalMs = keepaliveDuration * 1000;
+          runtime.log?.(`[${account.accountId}] keepAlive enabled: ${keepaliveDuration}s interval (${intervalMs}ms)`);
+          keepAliveTimer = setInterval(async () => {
+            if (stopped || abortSignal.aborted) return;
+            try {
+              await api.keepAlive();
+              // Persist refreshed cookies to disk (request() auto-updates CookieJar in RAM)
+              const jar = api.getCookie();
+              const serialized = jar.serializeSync?.()?.cookies ?? jar.toJSON?.()?.cookies;
+              if (serialized) {
+                refreshCredentials(serialized);
+              }
+            } catch (err) {
+              runtime.error(`[${account.accountId}] keepAlive failed: ${String(err)}`);
             }
-          } catch (err) {
-            runtime.error(`[${account.accountId}] keepAlive failed: ${String(err)}`);
+          }, intervalMs);
+        } else {
+          runtime.log?.(`[${account.accountId}] keepAlive disabled (no server-provided duration)`);
+        }
+      };
+
+      const scheduleReconnect = () => {
+        if (stopped || abortSignal.aborted) {
+          resolveRunning?.();
+          return;
+        }
+        reconnectAttempts += 1;
+        // Backoff: 3s, 6s, 12s, 24s, then capped at 48s per attempt.
+        const delayMs = Math.min(60000, 3000 * 2 ** Math.min(reconnectAttempts - 1, 4));
+        runtime.log?.(`[${account.accountId}] scheduling zca-js listener reconnect #${reconnectAttempts} in ${Math.round(delayMs / 1000)}s`);
+        if (restartTimer) clearTimeout(restartTimer);
+        restartTimer = setTimeout(() => {
+          restartTimer = null;
+          if (stopped || abortSignal.aborted) {
+            resolveRunning?.();
+            return;
           }
-        }, intervalMs);
-      } else {
-        runtime.log?.(`[${account.accountId}] keepAlive disabled (no server-provided duration)`);
+          // A "closed" event always runs zca-js's reset() first, so this.ws is null
+          // here and start() creates a fresh socket. We deliberately do NOT call
+          // stop() (stopping a live socket emits an async "closed" that would loop).
+          try {
+            api.listener.start({ retryOnClose: false });
+            armKeepAlive();
+            runtime.log?.(`[${account.accountId}] zca-js listener reconnect attempt started`);
+          } catch (err) {
+            runtime.error(`[${account.accountId}] zca-js listener reconnect failed: ${String(err)}`);
+            scheduleReconnect();
+          }
+        }, delayMs);
+        restartTimer.unref?.();
+      };
+
+      api.listener.start({ retryOnClose: false });
+      // A keepAlive setup failure must NOT tear down a listener that just started
+      // successfully — otherwise it routes into the retry/catch path below and the
+      // (now otherwise-unreachable) live-socket stop();start() re-entry branch.
+      try {
+        armKeepAlive();
+      } catch (err) {
+        runtime.error(`[${account.accountId}] keepAlive arm failed: ${String(err)}`);
       }
     } catch (err) {
       const errMsg = String(err);
